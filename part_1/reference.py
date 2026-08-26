@@ -51,20 +51,20 @@ class ReferenceModel:
         self.cfg_xy = cfg_xy if cfg_xy is not None else RefAxisConfig()
         self.cfg_psi = cfg_psi if cfg_psi is not None else RefAxisConfig()
         self.eta_ref = np.zeros(6)
-        self.nu_ref = np.zeros(6)
-        self.acc_ref = np.zeros(6)
+        self.dot_eta_ref = np.zeros(6)
+        self.ddot_eta_ref = np.zeros(6)
 
     def reset(self, eta0: np.ndarray) -> None:
         """Initialize the reference at the vessel's current (6,) state."""
         self.eta_ref = np.asarray(eta0, dtype=float).reshape(6).copy()
-        self.nu_ref = np.zeros(6)
-        self.acc_ref = np.zeros(6)
+        self.dot_eta_ref = np.zeros(6)
+        self.ddot_eta_ref = np.zeros(6)
 
     def step(
         self, t: float, dt: float, eta_cmd: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         # TODO: Replace this pass-through placeholder with your reference model.
         self.eta_ref = np.asarray(eta_cmd, dtype=float).reshape(6).copy()
-        self.nu_ref = np.zeros(6)
-        self.acc_ref = np.zeros(6)
-        return self.eta_ref, self.nu_ref, self.acc_ref
+        self.dot_eta_ref = np.zeros(6)
+        self.ddot_eta_ref = np.zeros(6)
+        return self.eta_ref, self.dot_eta_ref, self.ddot_eta_ref

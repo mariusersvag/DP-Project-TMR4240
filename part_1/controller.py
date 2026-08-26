@@ -45,9 +45,9 @@ constructor defaults. Tuning only inside ``run_case_part1.py`` will pass your
 own runs but fail the checks.
 """
 import numpy as np
-
-from utils import wrap_eta
-
+import scipy as sp
+from simulation.utils import Rz, wrap_angle_pi
+DOF3 = np.array([0, 1, 5])
 
 class DPController:
     """
@@ -58,11 +58,67 @@ class DPController:
     """
 
     def __init__(self, *args, **kwargs):
-        pass
+
+        self.M3 = np.array([
+            [6.007e5, 0.0, 0.0],
+            [0.0, 7.067e5, -4.733e5],
+            [0.0, -5.712e5, 5.456e7],
+        ])
+        self.D3 = np.diag([1117.6, 2.229e4, 1.95e6])
+
+        self.A, self.B = self.build_ss_model()
+
+        self.int_ned = np.zeros(2)  # [N, E] integral state
+        self.int_psi = 0.0          # [psi] integral state
+
+        self.Q = np.diag([
+            ..., ..., ...,   # position / heading
+            ..., ..., ...,   # velocities
+            ..., ..., ...,   # integral states
+        ])
+
+        self.R = np.diag([
+            ..., ..., ...,   # Fx, Fy, Mz
+        ])
+
+        self.K = self.build_lqr_gain()
+
+        self.aw_gain = float(kwargs.get("aw_gain", 1.0))
+        if self.aw_gain < 0.0:
+            raise ValueError("aw_gain must be non-negative")
+
+        # Maps a BODY-wrench tracking error to the corresponding change in
+        # the integral state.  Pinv also handles a weak/uncontrolled axis.
+        self._aw_body_map = np.linalg.pinv(-self.K[:, 6:9])
+        self._last_tau_d3 = np.zeros(3)
+        self._has_last_tau_d = False
+
 
     def reset(self) -> None:
         """Optional: reset internal states (integrators, filters) before a run."""
-        pass
+        self.int_ned = np.zeros(2)
+        self.int_psi = 0.0
+        self._last_tau_d3.fill(0.0)
+        self._has_last_tau_d = False
+
+    def apply_external_aw(
+        self,
+        tau_applied: np.ndarray,
+        psi: float,
+        dt: float,
+    ) -> None:
+        """Back-calculate integral state from the applied BODY wrench."""
+        if not self._has_last_tau_d or self.aw_gain == 0.0 or dt <= 0.0:
+            return
+
+        tau_applied3 = np.asarray(tau_applied, dtype=float).reshape(6)[DOF3]
+        wrench_error_body = tau_applied3 - self._last_tau_d3
+        int_correction_body = self._aw_body_map @ wrench_error_body
+        int_correction_ned = Rz(psi) @ int_correction_body
+
+        scale = self.aw_gain * dt
+        self.int_ned += scale * int_correction_ned[:2]
+        self.int_psi += scale * int_correction_ned[2]
 
     def compute(
         self,
@@ -74,10 +130,155 @@ class DPController:
         nu_ref: np.ndarray | None = None,
         acc_ref: np.ndarray | None = None,
     ) -> np.ndarray:
-        # TODO: Replace this placeholder with your DP controller.
-        # Return the (6,) desired BODY wrench — fill in tau_d[0] = Fx,
-        # tau_d[1] = Fy, tau_d[5] = Mz and leave the rest zero.
+        
+        dot_eta_ref = nu_ref if nu_ref is not None else np.zeros(6)
+        ddot_eta_ref = acc_ref if acc_ref is not None else np.zeros(6)
 
-        error_eta = wrap_eta(eta_ref - eta)
 
-        return np.zeros(6)
+        R = Rz(eta[5])  # BODY -> NED rotation matrix
+
+        e_eta_ned, e_eta_body, e_nu_body = self.compute_errors(
+            eta,
+            nu,
+            eta_ref,
+            dot_eta_ref,
+            R
+        )
+
+        # Integrate error in NED
+        self.int_ned += e_eta_ned[:2] * dt
+        self.int_psi += e_eta_ned[2] * dt
+
+        integral_ned_3 = np.array([
+            self.int_ned[0],
+            self.int_ned[1],
+            self.int_psi,
+        ])
+
+        integral_body = R.T @ integral_ned_3
+
+        x = np.concatenate([
+            e_eta_body,
+            e_nu_body,
+            integral_body,
+        ])
+
+        tau_feedback = -self.K @ x
+
+        nu_ref_body, dot_nu_ref_body = self.compute_reference_kinematics(eta_ref, dot_eta_ref, ddot_eta_ref)
+        tau_ff_ref = self.M3 @ dot_nu_ref_body + self.D3 @ nu_ref_body
+
+        tau_d = np.zeros(6)
+        tau_d[DOF3] = tau_feedback + tau_ff_ref
+
+        self._last_tau_d3[:] = tau_d[DOF3]
+        self._has_last_tau_d = True
+
+        return tau_d
+
+    def build_ss_model(self):
+        Z = np.zeros((3, 3))
+        I = np.eye(3)
+
+        M3_inv = np.linalg.solve(self.M3, I)
+        M3_inv_D3 = np.linalg.solve(self.M3, self.D3)
+
+        A = np.block([
+            [Z, I, Z],
+            [Z, -M3_inv_D3, Z],
+            [I, Z, Z]
+        ])
+
+        B = np.vstack([
+            Z,
+            M3_inv,
+            Z
+        ])
+
+        return A, B
+
+    def compute_errors(
+        self,
+        eta: np.ndarray,
+        nu: np.ndarray,
+        eta_ref: np.ndarray,
+        dot_eta_ref: np.ndarray | None,
+        R: np.ndarray
+    ):
+        eta3 = np.asarray(eta)[DOF3]
+        eta_ref3 = np.asarray(eta_ref)[DOF3]
+
+        nu_body = np.asarray(nu)[DOF3]
+
+        if dot_eta_ref is None:
+            dot_eta_ref_ned = np.zeros(3)
+        else:
+            dot_eta_ref_ned = np.asarray(dot_eta_ref)[DOF3]
+
+        psi = eta3[2]
+
+        # Position / heading error in NED
+        e_eta_ned = eta3 - eta_ref3
+        e_eta_ned = e_eta_ned.copy()
+        e_eta_ned[2] = wrap_angle_pi(e_eta_ned[2])
+
+        # Transform position error to BODY
+        e_eta_body = R.T @ e_eta_ned
+
+        # Desired NED velocity -> BODY
+        nu_ref_body = R.T @ dot_eta_ref_ned
+
+        # Velocity error in BODY
+        e_nu_body = nu_body - nu_ref_body
+
+        return e_eta_ned, e_eta_body, e_nu_body
+
+
+    def build_lqr_gain(self):
+        P = sp.linalg.solve_continuous_are(
+                self.A,
+                self.B,
+                self.Q,
+                self.R,
+            )
+
+        K = np.linalg.solve(
+            self.R,
+            self.B.T @ P,
+        )
+
+        return K
+
+    def compute_reference_kinematics(
+        self,
+        eta_ref: np.ndarray,
+        dot_eta_ref: np.ndarray,
+        ddot_eta_ref: np.ndarray,
+    ):
+        eta_ref3 = np.asarray(eta_ref)[DOF3]
+        dot_eta_ref3 = np.asarray(dot_eta_ref)[DOF3]
+        ddot_eta_ref3 = np.asarray(ddot_eta_ref)[DOF3]
+
+        psi_ref = eta_ref3[2]
+
+        # BODY -> NED for the reference orientation
+        R_ref = Rz(psi_ref)
+
+        # Desired BODY velocity:
+        nu_ref_body = R_ref.T @ dot_eta_ref3
+
+        # Desired yaw rate
+        r_ref = nu_ref_body[2]
+
+        # Skew symmetric matrix
+        S_r = np.array([
+            [0.0,   -r_ref, 0.0],
+            [r_ref,  0.0,   0.0],
+            [0.0,    0.0,   0.0],
+        ])
+
+        # Desired BODY velocity derivative:
+        # dot(nu_d)^b = R_d^T ddot(eta_d)^n - S(r_d) nu_d^b
+        dot_nu_ref_body = R_ref.T @ ddot_eta_ref3 - S_r @ nu_ref_body
+
+        return nu_ref_body, dot_nu_ref_body

@@ -82,14 +82,15 @@ class DPController:
         ])
 
         self.K = self.build_lqr_gain()
+        K_I = self.K[:, 6:9]
+        if np.linalg.matrix_rank(K_I) < 3:
+            raise ValueError("Integral gain matrix is singular")
 
-        self.aw_gain = float(kwargs.get("aw_gain", 1.0))
-        if self.aw_gain < 0.0:
-            raise ValueError("aw_gain must be non-negative")
+        self.aw_gain = 1.0 # 1/Time constant of anti-windup back-calculation
 
         # Maps a BODY-wrench tracking error to the corresponding change in
-        # the integral state.  Pinv also handles a weak/uncontrolled axis.
-        self._aw_body_map = np.linalg.pinv(-self.K[:, 6:9])
+        # the integral state.
+        self._aw_body_map = np.linalg.solve(-K_I, np.eye(3))
         self._last_tau_d3 = np.zeros(3)
         self._has_last_tau_d = False
 
@@ -101,24 +102,6 @@ class DPController:
         self._last_tau_d3.fill(0.0)
         self._has_last_tau_d = False
 
-    def apply_external_aw(
-        self,
-        tau_applied: np.ndarray,
-        psi: float,
-        dt: float,
-    ) -> None:
-        """Back-calculate integral state from the applied BODY wrench."""
-        if not self._has_last_tau_d or self.aw_gain == 0.0 or dt <= 0.0:
-            return
-
-        tau_applied3 = np.asarray(tau_applied, dtype=float).reshape(6)[DOF3]
-        wrench_error_body = tau_applied3 - self._last_tau_d3
-        int_correction_body = self._aw_body_map @ wrench_error_body
-        int_correction_ned = Rz(psi) @ int_correction_body
-
-        scale = self.aw_gain * dt
-        self.int_ned += scale * int_correction_ned[:2]
-        self.int_psi += scale * int_correction_ned[2]
 
     def compute(
         self,
@@ -176,6 +159,29 @@ class DPController:
 
         return tau_d
 
+    def apply_external_aw(
+        self,
+        tau_applied: np.ndarray,
+        psi: float,
+        dt: float,
+    ) -> None:
+        """
+        Anti windup implemented with back calculation.  
+        The simulator calls this after thrust allocation, so tau_applied is the actual wrench applied to the vessel.
+        """
+        if not self._has_last_tau_d or self.aw_gain == 0.0 or dt <= 0.0:
+            return
+
+        tau_applied3 = tau_applied[DOF3]
+        wrench_error_body = tau_applied3 - self._last_tau_d3
+        int_correction_body = self._aw_body_map @ wrench_error_body
+        int_correction_ned = Rz(psi) @ int_correction_body
+
+        scale = self.aw_gain * dt
+        self.int_ned += scale * int_correction_ned[:2]
+        self.int_psi += scale * int_correction_ned[2]
+
+
     def build_ss_model(self):
         Z = np.zeros((3, 3))
         I = np.eye(3)
@@ -214,8 +220,6 @@ class DPController:
             dot_eta_ref_ned = np.zeros(3)
         else:
             dot_eta_ref_ned = np.asarray(dot_eta_ref)[DOF3]
-
-        psi = eta3[2]
 
         # Position / heading error in NED
         e_eta_ned = eta3 - eta_ref3

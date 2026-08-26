@@ -46,6 +46,8 @@ own runs but fail the checks.
 """
 import numpy as np
 
+from utils import wrap_eta
+
 
 class DPController:
     """
@@ -75,4 +77,7 @@ class DPController:
         # TODO: Replace this placeholder with your DP controller.
         # Return the (6,) desired BODY wrench — fill in tau_d[0] = Fx,
         # tau_d[1] = Fy, tau_d[5] = Mz and leave the rest zero.
+
+        error_eta = wrap_eta(eta_ref - eta)
+
         return np.zeros(6)
